@@ -4,7 +4,6 @@ package traefik_umami_plugin
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -106,84 +105,109 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		return nil, err
 	}
 
-	configJSON, _ := json.Marshal(config)
+	/*configJSON, _ := json.Marshal(config)
 	h.log(fmt.Sprintf("config: %s", configJSON))
 	if config.ScriptInjection {
 		h.log(fmt.Sprintf("script: %s", scriptHtml))
 	} else {
 		h.log("script: scriptInjection is false")
-	}
+	}*/
 
 	return h, nil
 }
 
 func (h *PluginHandler) log(message string) {
 	level := "info" // default to info
-	time := time.Now().Format("2006-01-02T15:04:05Z")
+	currentTime := time.Now().Format("2006-01-02T15:04:05Z")
 
 	if h.LogHandler != nil {
-		h.LogHandler.Println(fmt.Sprintf("time=\"%s\" level=%s msg=\"[traefik-umami-plugin] %s\"", time, level, message))
+		h.LogHandler.Println(fmt.Sprintf("time=\"%s\" level=%s msg=\"[traefik-umami-plugin] %s\"", currentTime, level, message))
 	}
 }
 
 func (h *PluginHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// check if config is valid
 	if !h.configIsValid {
+		h.log("Invalid configuration, passing through request")
 		h.next.ServeHTTP(rw, req)
 		return
 	}
 
-	// forwarding
-	shouldForwardToUmami, pathAfter := isUmamiForwardPath(req, &h.config)
-	if shouldForwardToUmami {
-		// h.log(fmt.Sprintf("Forward %s", req.URL.EscapedPath()))
+	// Forwarding logic: if request URL matches forwarding path, forward regardless of method
+	if ok, pathAfter := isUmamiForwardPath(req, &h.config); ok {
+		//h.log(fmt.Sprintf("Forward %s", req.URL.EscapedPath()))
 		h.forwardToUmami(rw, req, pathAfter)
 		return
 	}
 
-	// script injection
+	// For non-GET requests, pass through unmodified
+	if req.Method != http.MethodGet {
+		//h.log(fmt.Sprintf("Non-GET request (%s), passing through", req.Method))
+		h.next.ServeHTTP(rw, req)
+		return
+	}
+
+	// For GET requests, process script injection if enabled
 	var injected bool = false
 	if h.config.ScriptInjection {
-		// intercept body
-		myrw := &responseWriter{
-			buffer:         &bytes.Buffer{},
-			ResponseWriter: rw,
-		}
-		myrw.Header().Set("Accept-Encoding", "identity")
-		h.next.ServeHTTP(myrw, req)
-
-		if strings.HasPrefix(myrw.Header().Get("Content-Type"), "text/html") {
-			// h.log(fmt.Sprintf("Inject %s", req.URL.EscapedPath()))
-			origBytes := myrw.buffer.Bytes()
+		rb := newResponseBuffer(rw)
+		h.next.ServeHTTP(rb, req)
+		contentType := rb.Header().Get("Content-Type")
+		if strings.HasPrefix(contentType, "text/html") {
+			origBytes := rb.buf.Bytes()
 			newBytes := regexReplaceSingle(origBytes, insertBeforeRegex, h.scriptHtml)
 			if !bytes.Equal(origBytes, newBytes) {
-				_, err := rw.Write(newBytes)
-				if err != nil {
-					h.log(err.Error())
-				}
+				rb.buf.Reset()
+				rb.buf.Write(newBytes)
 				injected = true
+				//h.log(fmt.Sprintf("Injected script into %s", req.URL.EscapedPath()))
 			}
 		}
-	}
-
-	// server side tracking
-	shouldServerSideTrack := shouldServerSideTrack(req, &h.config, injected, h)
-	if shouldServerSideTrack {
-		// h.log(fmt.Sprintf("Track %s", req.URL.EscapedPath()))
-		go buildAndSendTrackingRequest(req, &h.config)
-	}
-
-	if !injected {
-		// h.log(fmt.Sprintf("Continue %s", req.URL.EscapedPath()))
+		rb.Flush()
+	} else {
 		h.next.ServeHTTP(rw, req)
 	}
+
+	// Server side tracking for GET requests
+	if shouldServerSideTrack(req, &h.config, injected, h) {
+		go buildAndSendTrackingRequest(req, &h.config)
+	}
 }
 
-type responseWriter struct {
-	buffer *bytes.Buffer
-	http.ResponseWriter
+// responseBuffer buffers the response for script injection.
+type responseBuffer struct {
+	rw          http.ResponseWriter
+	buf         *bytes.Buffer
+	statusCode  int
+	wroteHeader bool
 }
 
-func (w *responseWriter) Write(p []byte) (int, error) {
-	return w.buffer.Write(p)
+func newResponseBuffer(rw http.ResponseWriter) *responseBuffer {
+	return &responseBuffer{
+		rw:  rw,
+		buf: &bytes.Buffer{},
+	}
+}
+
+func (rb *responseBuffer) Header() http.Header {
+	return rb.rw.Header()
+}
+
+func (rb *responseBuffer) WriteHeader(statusCode int) {
+	if !rb.wroteHeader {
+		rb.statusCode = statusCode
+		rb.wroteHeader = true
+	}
+}
+
+func (rb *responseBuffer) Write(p []byte) (int, error) {
+	return rb.buf.Write(p)
+}
+
+func (rb *responseBuffer) Flush() {
+	if !rb.wroteHeader {
+		rb.statusCode = http.StatusOK
+	}
+	rb.rw.WriteHeader(rb.statusCode)
+	rb.rw.Write(rb.buf.Bytes())
 }
