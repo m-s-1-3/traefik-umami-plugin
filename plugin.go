@@ -153,7 +153,15 @@ func (h *PluginHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		rb := newResponseBuffer(rw)
 		h.next.ServeHTTP(rb, req)
 		contentType := rb.Header().Get("Content-Type")
-		if strings.HasPrefix(contentType, "text/html") {
+		// Only inject script for 2xx responses with text/html content type
+		// Skip injection for redirects (3xx) and error responses (4xx, 5xx)
+		// Note: statusCode 0 means WriteHeader wasn't called, treat as 200 OK
+		statusCode := rb.statusCode
+		if statusCode == 0 {
+			statusCode = http.StatusOK
+		}
+		isSuccessResponse := statusCode >= 200 && statusCode < 300
+		if isSuccessResponse && strings.HasPrefix(contentType, "text/html") {
 			origBytes := rb.buf.Bytes()
 			newBytes := regexReplaceSingle(origBytes, insertBeforeRegex, h.scriptHtml)
 			if !bytes.Equal(origBytes, newBytes) {
@@ -208,6 +216,8 @@ func (rb *responseBuffer) Flush() {
 	if !rb.wroteHeader {
 		rb.statusCode = http.StatusOK
 	}
+	// Update Content-Length header to match actual body size after potential modification
+	rb.rw.Header().Set("Content-Length", fmt.Sprintf("%d", rb.buf.Len()))
 	rb.rw.WriteHeader(rb.statusCode)
 	rb.rw.Write(rb.buf.Bytes())
 }
